@@ -5,7 +5,7 @@ import { Repository, DataSource } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { EngineFactory } from '../../engine/engine.factory';
 import { EngineRegistry } from '../../engine/engine-registry.service';
-import { decideReconnect, type ReconnectAttemptState } from './reconnect-policy';
+import { decideReconnect, clampNumber, type ReconnectAttemptState } from './reconnect-policy';
 import { SessionLivenessWatchdog } from './session-liveness-watchdog.service';
 import { MessageProjector } from './message-projector.service';
 import { SessionErrorStore } from './session-error-store.service';
@@ -30,6 +30,7 @@ import { SessionStatusBroadcaster } from './session-status-broadcaster';
 import { SessionEngineLeafEvents } from './session-engine-leaf-events';
 import { SessionEngineEventWiring, SessionEngineWiringHost } from './session-engine-event-wiring';
 import { SessionEngineControls } from './session-engine-controls';
+import { SessionOwnershipService, nodeOwnsSession } from './session-ownership.service';
 
 /**
  * Eager status-history reads are opt-in. On affected freshly paired whatsapp-web.js accounts,
@@ -40,8 +41,9 @@ const isStatusSeedOnReadyEnabled = (): boolean => process.env.STATUS_SEED_ON_REA
 
 // Message types that carry downloadable media. Any persisted row of these types must have a media
 // marker in metadata — never NULL — or the dashboard renders an empty bubble (no placeholder) and the
-// by-type stats filter skips the row. Sources that lack the payload (wwjs own-send echo, media-free
-// history sync) get the omitted marker synthesized at the persistence chokepoints.
+// by-type stats filter skips the row. Sources that arrive without a media field (media-free history
+// sync, a wwjs own-send echo whose download failed) get the omitted marker synthesized at the
+// persistence chokepoints.
 
 export interface ReconnectState extends ReconnectAttemptState {
   /** The pending attempt's timer. Lives here, not in the policy, which stays free of side effects. */
@@ -54,8 +56,6 @@ export interface ReconnectState extends ReconnectAttemptState {
 const RECONNECT_BASE_DELAY_MIN_MS = 1000;
 const RECONNECT_BASE_DELAY_MAX_MS = 300_000;
 const RECONNECT_MAX_ATTEMPTS_CAP = 20;
-
-const clampNumber = (n: number, min: number, max: number): number => Math.min(Math.max(n, min), max);
 
 /** Coerce + clamp the untyped session.config reconnect knobs to finite, bounded values. Defaults are
  *  a 5000ms base delay and UNLIMITED attempts (`Infinity`): a long-lived session must keep retrying
@@ -255,6 +255,11 @@ export class SessionEngineLifecycle {
     // running gateway always has it.
     @Optional()
     private readonly auditService?: AuditService,
+    // @Optional for the same reason as the three above: direct-construction specs omit it, and an
+    // absent ownership service means a single-process deployment where every session is ours. The
+    // ownsSession() default below therefore has to be TRUE, not false.
+    @Optional()
+    private readonly ownership?: SessionOwnershipService,
   ) {
     // The fence Maps are handed over BY REFERENCE: they stay lifecycle fields (specs poke them
     // through the lifecycle), while the fence logic operates on the same instances.
@@ -286,6 +291,7 @@ export class SessionEngineLifecycle {
     // promise and add settlement hops the retirement-race specs assert against).
     this.wiringHost = {
       isLiveEngine: (id, engine) => this.isLiveEngine(id, engine),
+      ownsSession: id => this.ownsSession(id),
       handleEngineReady: (id, engine, phone, pushName) => this.handleEngineReady(id, engine, phone, pushName),
       handleEngineDisconnected: (id, engine, reason) => this.handleEngineDisconnected(id, engine, reason),
       updateStatus: (id, status) => this.updateStatus(id, status),
@@ -324,6 +330,7 @@ export class SessionEngineLifecycle {
     // runtime — delete()'s transaction must read the current value at call time), and the core
     // call-ins are NON-async passthrough closures (the Task-1 delegate rule above).
     this.controls = new SessionEngineControls({
+      ownsSession: (id: string) => this.ownsSession(id),
       sessionRepository: this.sessionRepository,
       engineFactory: this.engineFactory,
       engines: this.engineRegistry,
@@ -442,6 +449,18 @@ export class SessionEngineLifecycle {
   }
 
   /**
+   * Drop a mark set by markStopping().
+   *
+   * The "harmless, cleared by the next start()" reasoning above holds only while a session row
+   * exists. start() and delete() clear the mark after their own requireSession, so for an id that
+   * has no row neither reclamation path is reachable and the entry would outlive the process. Used
+   * by SessionService for exactly that case; a refusal against a real session still leaves its mark.
+   */
+  clearStopping(id: string): void {
+    this.stoppingSessions.delete(id);
+  }
+
+  /**
    * True while this process still has anything alive for the session: a registered engine, an
    * in-flight start(), or reconnect state whose armed/executing attempt will re-register one.
    * The ownership heartbeat consults this so a claim that no longer covers an engine stops being
@@ -482,6 +501,31 @@ export class SessionEngineLifecycle {
    */
   private isLiveEngine(id: string, engine: IWhatsAppEngine): boolean {
     return this.engines.isLive(id, engine);
+  }
+
+  /**
+   * May this node still write for `id`? Orthogonal to isLiveEngine, and both are required before a
+   * status is persisted from an engine callback.
+   *
+   * A lease can lapse while the process is perfectly healthy — a slow query is enough. The heartbeat
+   * notices at its next tick and tears the local engine down, but until that finishes isLiveEngine
+   * is still true, so a dying generation can persist a status onto a row a peer now owns. FAILED is
+   * the expensive one: it is excluded from the boot reset AND from the takeover sweep, so a session
+   * pushed into it is out of every automatic recovery path on every node until an operator acts.
+   *
+   * Defaults TRUE only when no ownership service is wired, which in practice means a
+   * direct-construction spec — the service is an unconditional SessionModule provider, so a running
+   * gateway always has one and this fence is live single-node too.
+   *
+   * SCOPE, stated plainly so the guarantee is not read wider than it is. Fenced: the three status
+   * writes in the event wiring, the exhausted-reconnect FAILED, and the start-path FAILED in
+   * controls. NOT fenced: handleEngineReady's direct row write and handleEngineDisconnected's
+   * DISCONNECTED — both statuses are in the boot reset's activeStatuses AND in TAKEOVER_STATUSES,
+   * so a wrong one self-heals, unlike FAILED. The gate is also a point-in-time read: `owned` can
+   * change while the awaited write is in flight, so this narrows the window rather than closing it.
+   */
+  private ownsSession(id: string): boolean {
+    return nodeOwnsSession(this.ownership, id);
   }
 
   private async initializeEngine(id: string, session: Session): Promise<void> {
@@ -845,7 +889,10 @@ export class SessionEngineLifecycle {
       // Don't leave the session silently stuck DISCONNECTED — mark it terminally FAILED with a reason
       // so findOne/findAll surface it via `lastError` and the dashboard shows it needs a restart.
       this.sessionErrors.set(id, decision.reason);
-      void this.updateStatus(id, SessionStatus.FAILED);
+      // Same ownership fence as the engine callbacks: a reconnect chain that exhausts itself after
+      // this node's lease lapsed must not park a peer's session in FAILED, which nothing resets
+      // automatically. The in-memory error above is per-process and harmless either way.
+      if (this.ownsSession(id)) void this.updateStatus(id, SessionStatus.FAILED);
       // Terminal path — evict the dead engine so it neither holds a concurrency slot nor makes a
       // subsequent start() reject the session as "already started". This mirrors onError's terminal
       // path (the same rationale: leaving the engine in the map wedges the session). The engine may

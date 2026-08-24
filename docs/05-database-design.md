@@ -367,6 +367,20 @@ clears it, and so does a gateway restart.
 | `reconnectBaseDelay`   | `5000` ms | Base delay of the reconnect backoff, clamped to 1000–300000 ms           |
 | `autoRejectCalls`      | `false`   | Auto-reject an incoming call as soon as it rings                         |
 
+Set them at creation with `POST /api/sessions`, or on an existing session with
+`PATCH /api/sessions/{sessionId}/config` — no restart, and no re-scan of the QR. The patch merges, so a key
+it does not mention keeps its stored value, and an explicit `null` clears a key back to the default
+above (the only way back to unlimited reconnect attempts once a cap is set).
+
+When each takes effect differs, because each is read at a different moment: `autoRejectCalls` is
+re-read from this row on every incoming call, so a patch applies to the next call. The two reconnect
+keys are read once per `start()` into the in-memory reconnect state, so a patch applies on the next
+start and leaves a reconnect sequence already in flight alone.
+
+`GET /api/sessions/{sessionId}/config` reports the effective values. It reports only these three keys and
+never the raw column — `config` is stripped from `SessionResponseDto` alongside the
+credential-bearing `proxyUrl`, and echoing an opaque blob back would defeat that.
+
 > [!NOTE]
 > Proxy settings are **not** read from `config` — they live in the dedicated `proxyUrl` / `proxyType` columns shown in the DDL above. Puppeteer options are global engine configuration from the environment (`engine.puppeteer.*`), not per-session. Anything else placed in `config` is stored but ignored.
 
@@ -415,6 +429,7 @@ CREATE TABLE webhooks (
   "group.join",
   "group.leave",
   "group.update",
+  "group.join_request",
   "call.received",
   "call.accepted",
   "call.rejected",
@@ -563,7 +578,7 @@ CREATE INDEX "IDX_c69efb19bf127c97e6740ad530" ON audit_logs("createdAt");
 `api_key_updated`, `api_key_used`, `api_key_revoked`, `api_key_deleted`, `api_key_auth_failed`), session
 lifecycle (`session_created`, `session_started`, `session_stopped`, `session_force_killed`,
 `session_logged_out`, `session_deleted`, `session_qr_generated`, `session_connected`,
-`session_disconnected`), WhatsApp-imposed account restrictions (`session_restricted`,
+`session_disconnected`, `session_config_updated`), WhatsApp-imposed account restrictions (`session_restricted`,
 `session_restriction_lifted`), messages
 (`message_sent`, `message_failed`), send-pacing enforcement (`send_pacing_blocked`, sampled to at
 most one row per session per minute; `send_breaker_tripped`, never sampled), webhooks (`webhook_created`, `webhook_deleted`,
@@ -806,7 +821,8 @@ src/database/migrations/           # data connection (pluggable)
 ├── 1785700000000-AddMessageMediaArchive.ts
 ├── 1785800000000-AddSessionOwnership.ts
 ├── 1785900000000-AddAutomationRules.ts            # 14th migration table; FKs sessions ON DELETE CASCADE
-└── 1786000000000-AddSessionNodeUrl.ts
+├── 1786000000000-AddSessionNodeUrl.ts
+└── 1786100000000-AddMessageMediaPathIndex.ts   # partial index on messages.mediaPath (orphan sweep)
 ```
 
 > [!NOTE]

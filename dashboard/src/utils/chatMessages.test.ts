@@ -17,6 +17,8 @@ const hist = (over: Partial<EngineHistoryMessage> = {}): EngineHistoryMessage =>
   type: 'text',
   timestamp: 1782053533,
   fromMe: false,
+  isGroup: true,
+  kind: 'group',
   ...over,
 });
 
@@ -152,7 +154,7 @@ test('mergeOrAppend keeps existing metadata when the incoming copy carries none'
 });
 
 test('mergeOrAppend: an omitted-media echo does NOT clobber the copy holding the payload', () => {
-  // The optimistic send bubble holds the only base64 copy; the engine's own-send echo carries just
+  // The optimistic send bubble holds the only base64 copy; a Baileys API-send echo carries just
   // `{media: {omitted: true}}` (no data). Replacing wholesale would blank the sent image.
   const optimistic = msg({
     id: 'm-1',
